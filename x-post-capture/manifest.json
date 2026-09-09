@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+  "name": "X Post Capture",
+  "version": "1.0.0",
+  "description": "X の個別投稿ページで TweetResultByRestId レスポンスを自動キャプチャして保存する",
+  "permissions": ["downloads", "storage"],
+  "host_permissions": ["https://x.com/*", "https://twitter.com/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://x.com/*/status/*", "https://twitter.com/*/status/*"],
+      "js": ["content.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["https://x.com/*/status/*", "https://twitter.com/*/status/*"],
+      "js": ["bridge.js"],
+      "run_at": "document_start",
+      "world": "ISOLATED"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "X Post Capture"
+  }
+}

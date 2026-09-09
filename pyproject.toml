@@ -1,0 +1,9 @@
+[project]
+name = "archive-work"
+requires-python = ">=3.10"
+dependencies = [
+    "ruff==0.16.6",
+]
+
+[tool.ruff.lint]
+ignore = ["BLE001", "S110"]

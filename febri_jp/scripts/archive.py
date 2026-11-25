@@ -6,9 +6,14 @@ febri_jp/source/ 配下に HTML ファイルとして保存する。
 ページ内の febri.jp ドメインの画像も同じディレクトリにダウンロードし、
 HTML 内の src をローカルパスに書き換える。
 
+CSV の pages が 2 以上の記事は、1 ページ目のページ送り
+（div.pagination a.post-page-numbers）のリンクに追従して 2 ページ目以降も保存する。
+
 保存パス規則:
-  https://febri.jp/topics/foo/ → source/topics/foo/index.html
+  https://febri.jp/topics/foo/   → source/topics/foo/index.html
   画像: source/topics/foo/<ファイル名>
+  https://febri.jp/topics/foo/2/ → source/topics/foo/2/index.html
+  画像: source/topics/foo/2/<ファイル名>
 
 使い方:
   # すべての CSV を処理
@@ -65,12 +70,13 @@ logger = logging.getLogger(__name__)
 
 
 # ---- ユーティリティ ----------------------------------------------------------
-def collect_urls(csv_files: list[Path]) -> list[tuple[str, str]]:
-    """CSV ファイルから (csv_name, url) のリストを返す。
+def collect_urls(csv_files: list[Path]) -> list[tuple[str, str, int]]:
+    """CSV ファイルから (csv_name, url, pages) のリストを返す。
 
     febri.jp ホスト以外の URL は SSRF 防止のためスキップする。
+    pages 列が空・不正な場合は 1 として扱う。
     """
-    entries: list[tuple[str, str]] = []
+    entries: list[tuple[str, str, int]] = []
     for csv_path in csv_files:
         with csv_path.open(encoding="utf-8", newline="") as f:
             reader = csv.DictReader(f)
@@ -82,8 +88,48 @@ def collect_urls(csv_files: list[Path]) -> list[tuple[str, str]]:
                 if host != FEBRI_HOST and not host.endswith(f".{FEBRI_HOST}"):
                     logger.warning("SKIP (non-febri host) %s", url)
                     continue
-                entries.append((csv_path.name, url))
+                try:
+                    pages = max(1, int((row.get("pages") or "1").strip()))
+                except ValueError:
+                    logger.warning("pages 列が不正なため 1 とみなす: %s", url)
+                    pages = 1
+                entries.append((csv_path.name, url, pages))
     return entries
+
+
+def _article_base_path(url: str) -> str:
+    """記事 URL のパスを末尾スラッシュ付きで返す（例: /topics/foo/）。"""
+    path = urlparse(url).path
+    return path if path.endswith("/") else path + "/"
+
+
+def default_subpage_url(url: str, page_no: int) -> str:
+    """WordPress のページ分割規則に従った N ページ目の URL を返す（<記事URL>/N/）。"""
+    parsed = urlparse(url)
+    return f"{parsed.scheme}://{parsed.netloc}{_article_base_path(url)}{page_no}/"
+
+
+def extract_subpage_urls(html: str, url: str) -> dict[int, str]:
+    """
+    HTML のページ送り（div.pagination a.post-page-numbers）から
+    {ページ番号: URL} を返す。
+
+    同じ記事の <記事パス>/<数字>/ を指す febri.jp のリンクだけを対象にする。
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    pattern = re.compile(rf"^{re.escape(_article_base_path(url))}(\d+)/?$")
+    found: dict[int, str] = {}
+    for a in soup.select("div.pagination a.post-page-numbers[href]"):
+        abs_url = urljoin(url, a["href"])
+        if not is_febri_url(abs_url):
+            continue
+        m = pattern.match(urlparse(abs_url).path)
+        if not m:
+            continue
+        page_no = int(m.group(1))
+        if page_no >= 2:
+            found.setdefault(page_no, default_subpage_url(url, page_no))
+    return found
 
 
 def url_to_save_path(url: str, base_dir: Path) -> Path:
@@ -105,11 +151,15 @@ def url_to_save_path(url: str, base_dir: Path) -> Path:
     return base_dir.joinpath(*path_parts) / "index.html"
 
 
+def is_febri_url(url: str) -> bool:
+    """febri.jp ドメイン（サブドメイン含む）の URL かどうか判定する。"""
+    host = urlparse(url).netloc.lower()
+    return host == FEBRI_HOST or host.endswith(f".{FEBRI_HOST}")
+
+
 def is_febri_image(url: str) -> bool:
     """febri.jp ドメインの画像 URL かどうか判定する。"""
-    parsed = urlparse(url)
-    host = parsed.netloc.lower()
-    return host == FEBRI_HOST or host.endswith(f".{FEBRI_HOST}")
+    return is_febri_url(url)
 
 
 def image_filename(img_url: str) -> str:
@@ -273,24 +323,23 @@ async def inline_css(
 
 
 # ---- ページ保存 -------------------------------------------------------------
-async def save_page(
+PageResult = tuple[str, str, Path]  # (url, status, save_path)
+
+
+async def fetch_and_save(
     semaphore: asyncio.Semaphore,
     browser_context,
     http_client: httpx.AsyncClient,
     url: str,
-    force: bool,
-) -> tuple[str, str, Path]:
+    save_path: Path,
+) -> tuple[str, str | None]:
     """
-    1 ページを取得・画像ダウンロード込みで保存する。
+    1 ページを取得し、画像ダウンロード・CSS インライン化をして保存する。
 
-    戻り値: (url, status, save_path)
-      status: "saved" | "skipped" | "error:<message>"
+    戻り値: (status, html)
+      status: "saved" | "error:<message>"
+      html:   取得した HTML（書き換え前）。失敗時は None
     """
-    save_path = url_to_save_path(url, SOURCE_DIR)
-
-    if not force and save_path.exists():
-        return url, "skipped", save_path
-
     async with semaphore:
         last_exc: Exception | None = None
 
@@ -302,10 +351,12 @@ async def save_page(
                 )
                 # JS レンダリングの完了を待つ
                 await page.wait_for_timeout(2000)
-                html = await page.content()
+                raw_html = await page.content()
 
                 # 画像ダウンロード & src 書き換え
-                html = await download_images(html, url, save_path.parent, http_client)
+                html = await download_images(
+                    raw_html, url, save_path.parent, http_client
+                )
 
                 # CSS インライン化
                 html = await inline_css(html, url, http_client)
@@ -314,7 +365,7 @@ async def save_page(
                 save_path.write_text(html, encoding="utf-8")
 
                 await asyncio.sleep(REQUEST_DELAY)
-                return url, "saved", save_path
+                return "saved", raw_html
 
             except Exception as exc:
                 last_exc = exc
@@ -328,15 +379,111 @@ async def save_page(
                 await asyncio.sleep(RETRY_DELAY * attempt)  # 5s → 10s
 
         logger.error("FAILED %s : %s", url, last_exc)
-        return url, f"error:{last_exc}", save_path
+        return f"error:{last_exc}", None
+
+
+def _resolve_subpage_url(links: dict[int, str], url: str, page_no: int) -> str:
+    """ページ送りから得た N ページ目の URL を返す。見つからなければ既定規則で補う。"""
+    sub_url = links.get(page_no)
+    if sub_url is None:
+        sub_url = default_subpage_url(url, page_no)
+        logger.warning(
+            "ページ送りに %d ページ目のリンクがないため既定 URL を使う: %s",
+            page_no,
+            sub_url,
+        )
+    return sub_url
+
+
+async def save_page(
+    semaphore: asyncio.Semaphore,
+    browser_context,
+    http_client: httpx.AsyncClient,
+    url: str,
+    pages: int,
+    force: bool,
+) -> list[PageResult]:
+    """
+    1 記事を保存する。pages が 2 以上なら、ページ送りのリンクに追従して
+    2 ページ目以降も保存する。
+
+    保存済みのページは取得せずスキップする（--force 時を除く）。
+    スキップしたページも、リンク抽出のためにローカルの HTML を読む。
+
+    戻り値: ページごとの (url, status, save_path) のリスト
+      status: "saved" | "skipped" | "error:<message>"
+    """
+    results: list[PageResult] = []
+
+    save_path = url_to_save_path(url, SOURCE_DIR)
+    html: str | None = None
+    if not force and save_path.exists():
+        results.append((url, "skipped", save_path))
+        if pages >= 2:
+            html = save_path.read_text(encoding="utf-8")
+    else:
+        status, html = await fetch_and_save(
+            semaphore, browser_context, http_client, url, save_path
+        )
+        results.append((url, status, save_path))
+
+    if pages < 2:
+        return results
+
+    if html is None:
+        for page_no in range(2, pages + 1):
+            sub_url = default_subpage_url(url, page_no)
+            results.append(
+                (
+                    sub_url,
+                    "error:1 ページ目を取得できなかったため未取得",
+                    url_to_save_path(sub_url, SOURCE_DIR),
+                )
+            )
+        return results
+
+    links = extract_subpage_urls(html, url)
+
+    for page_no in range(2, pages + 1):
+        sub_url = _resolve_subpage_url(links, url, page_no)
+        sub_path = url_to_save_path(sub_url, SOURCE_DIR)
+
+        # 後続ページのリンクが未発見なら、このページのページ送りからも探す
+        need_more = any(n not in links for n in range(page_no + 1, pages + 1))
+
+        if not force and sub_path.exists():
+            results.append((sub_url, "skipped", sub_path))
+            sub_html = sub_path.read_text(encoding="utf-8") if need_more else None
+        else:
+            status, sub_html = await fetch_and_save(
+                semaphore, browser_context, http_client, sub_url, sub_path
+            )
+            results.append((sub_url, status, sub_path))
+
+        if sub_html is not None:
+            for n, u in extract_subpage_urls(sub_html, url).items():
+                links.setdefault(n, u)
+
+    if links and max(links) > pages:
+        logger.warning(
+            "ページ送りに CSV の pages（%d）を超えるページ（%d）がある: %s",
+            pages,
+            max(links),
+            url,
+        )
+
+    return results
 
 
 async def _run_browser_tasks(
-    entries: list[tuple[str, str]],
+    entries: list[tuple[str, str, int]],
     semaphore: asyncio.Semaphore,
     force: bool,
 ) -> dict[str, int]:
-    """ブラウザ・HTTP クライアントを起動してページ保存タスクを実行し、結果を返す。"""
+    """ブラウザ・HTTP クライアントを起動してページ保存タスクを実行し、結果を返す。
+
+    件数はページ単位で数える（2 ページ目以降も 1 件として数える）。
+    """
     results: dict[str, int] = {"saved": 0, "skipped": 0, "error": 0}
     async with (
         async_playwright() as pw,
@@ -347,36 +494,56 @@ async def _run_browser_tasks(
     ):
         context = await browser.new_context(user_agent=USER_AGENT, locale="ja-JP")
         tasks = [
-            save_page(semaphore, context, http_client, url, force) for _, url in entries
+            save_page(semaphore, context, http_client, url, pages, force)
+            for _, url, pages in entries
         ]
         total = len(tasks)
         for done, coro in enumerate(asyncio.as_completed(tasks), 1):
-            url, status, save_path = await coro
-            if status == "saved":
-                results["saved"] += 1
-                logger.info(
-                    "SAVED (%d/%d) %s → %s",
-                    done,
-                    total,
-                    url,
-                    save_path.relative_to(SOURCE_DIR),
-                )
-            elif status == "skipped":
-                results["skipped"] += 1
-                logger.info("SKIP  (%d/%d) %s", done, total, url)
-            elif status.startswith("error"):
-                results["error"] += 1
-                logger.error("FAILED (%d/%d) %s", done, total, url)
+            for url, status, save_path in await coro:
+                if status == "saved":
+                    results["saved"] += 1
+                    logger.info(
+                        "SAVED (%d/%d) %s → %s",
+                        done,
+                        total,
+                        url,
+                        save_path.relative_to(SOURCE_DIR),
+                    )
+                elif status == "skipped":
+                    results["skipped"] += 1
+                    logger.info("SKIP  (%d/%d) %s", done, total, url)
+                elif status.startswith("error"):
+                    results["error"] += 1
+                    logger.error("FAILED (%d/%d) %s : %s", done, total, url, status)
         await context.close()
     return results
 
 
 async def _process_entries(
-    entries: list[tuple[str, str]],
+    entries: list[tuple[str, str, int]],
     semaphore: asyncio.Semaphore,
     force: bool,
 ) -> dict[str, int]:
     return await _run_browser_tasks(entries, semaphore, force)
+
+
+def _dry_run_targets(url: str, pages: int) -> list[str]:
+    """ドライラン用に、記事の全ページ URL を返す（ネットワークにはアクセスしない）。
+
+    1 ページ目が保存済みならそのページ送りのリンクを使い、なければ既定規則で補う。
+    """
+    targets = [url]
+    if pages < 2:
+        return targets
+    save_path = url_to_save_path(url, SOURCE_DIR)
+    links = (
+        extract_subpage_urls(save_path.read_text(encoding="utf-8"), url)
+        if save_path.exists()
+        else {}
+    )
+    for page_no in range(2, pages + 1):
+        targets.append(links.get(page_no) or default_subpage_url(url, page_no))
+    return targets
 
 
 async def run(
@@ -390,14 +557,21 @@ async def run(
         logger.warning("対象 URL が見つかりませんでした。")
         return
 
-    logger.info("対象 URL: %d 件（CSV: %d ファイル）", len(entries), len(csv_files))
+    total_pages = sum(pages for _, _, pages in entries)
+    logger.info(
+        "対象 URL: %d 件 / %d ページ（CSV: %d ファイル）",
+        len(entries),
+        total_pages,
+        len(csv_files),
+    )
 
     if dry_run:
-        for csv_name, url in entries:
-            save_path = url_to_save_path(url, SOURCE_DIR)
-            exists = "EXISTS" if save_path.exists() else "NEW   "
-            print(f"[{exists}] [{csv_name}] {url}")
-            print(f"         → {save_path}")
+        for csv_name, url, pages in entries:
+            for target in _dry_run_targets(url, pages):
+                save_path = url_to_save_path(target, SOURCE_DIR)
+                exists = "EXISTS" if save_path.exists() else "NEW   "
+                print(f"[{exists}] [{csv_name}] {target}")
+                print(f"         → {save_path}")
         return
 
     semaphore = asyncio.Semaphore(concurrency)

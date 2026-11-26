@@ -7,7 +7,8 @@
 ```text
 febri_jp/
 ├── list/      # アーカイブ対象URLのCSVリスト
-├── scripts/   # ページ保存スクリプト
+├── scripts/   # ページ保存・Markdown 変換スクリプト
+├── output/    # Markdown 変換結果（index.md + 本文の画像） ※Git管理外
 └── source/    # 保存先（HTML + 画像） ※Git管理外
     ├── topics/
     │   └── <slug>/
@@ -25,6 +26,7 @@ febri_jp/
 ```
 
 `source/` は URL のパスをそのままディレクトリ階層にしている。
+`.markdownlint.jsonc` は Markdown 化した記事に適用する markdownlint の設定。
 
 ---
 
@@ -85,6 +87,38 @@ python3 scripts/archive.py --verbose                          # DEBUG ログを�
 - CSS と画像は HTML と同じタイムスタンプで取得する。febri.jp 以外の CSS（`@import` を含む）は取得しない
 - CSS や画像が `WAYBACK_TO` より後のキャプチャに解決された場合は、それ以前で最も近いキャプチャを取り直す
 - Internet Archive への同時リクエストは 2 件までに制限している
+
+### structurize.py
+
+`source/` に保存した HTML から記事の本文を抽出し、`output/` 配下に Markdown として書き出す。
+`source/` は読み取るだけで変更しない。
+
+```bash
+python3 scripts/structurize.py                                         # list/ 配下の全 CSV
+python3 scripts/structurize.py --list topics.csv febri_talk.csv        # 特定の CSV のみ
+python3 scripts/structurize.py --url https://febri.jp/topics/foo/      # 特定の記事のみ
+python3 scripts/structurize.py --output /path/to/out --workers 4       # 出力先・並列数を変更
+```
+
+- 出力パスは `source/topics/foo/index.html` → `output/topics/foo/index.md`
+- 2 ページ以上ある記事は、全ページを 1 つの `index.md` にまとめる。ページの境目には `<!-- page N -->` を入れる
+- 本文で使う画像は `source/` から同じ相対位置にコピーする（N ページ目の画像は `output/<記事>/N/`）。`srcset` に大きい画像があればそちらを使う
+- 出力する範囲は、タイトル、アイキャッチ、リード文、クレジット、本文の全ブロック、作品情報・書籍情報、カタリベプロフィール
+- カテゴリ、公開日時（CSV の `datetime`）、タグ、元 URL、ページ数、動画 URL（`tv.csv`）は front matter に入れる
+- ナビ、パンくず、SNS ボタン、ページ送り、関連記事、ランキング、広告は出力しない
+- エンサイクロペディア（`/series/gppedia/`）とカタリベリスト（`/febritalk/list/`）は各項目を見出しと本文にする
+- 変換の規則は次のとおり
+  - インタビューの話者名（色付き文字）は太字にする
+  - 改行（`<br>`）は `<br>` を使わずに段落を分ける。作品情報・書籍情報の中だけは、段落を分けずに行末の `\` で改行する。表のセルとリンク文字列の中の改行は空白にする
+  - 著作権表示（`ul.list-ttl`）はリストにせず、行末の `\` で改行した 1 段落にする
+  - 人物紹介など見出し語のある項目（`dl` の `dt` と `dd`）は、太字の見出し語と説明の段落にする
+  - 説明だけの注釈（※1 など）、画像のキャプション、プルクオートは引用ブロックにする
+  - YouTube、Spotify、Google マップ、ツイートの埋め込みと動画は、元の URL へのリンクにする
+  - 記事末尾のエンドマーク画像（`endmark.png`）はコピーせず、水平線（`---`）にする。エンドマークの直後に画像が続く場合は、その画像（キャプションを含む）の後ろに水平線を置く
+  - 変換対象の記事（全 CSV の記事。2 ページ目以降の URL を含む）を指す febri.jp のリンクは、変換後の `index.md` への相対リンクにする。それ以外の febri.jp のリンク（変換対象外のページ、動画ファイルなど）は元の URL のまま残し、件数をログに出す（`--verbose` で URL の一覧）
+- 変換のたびに、出力すべき領域のテキストと画像がすべて Markdown に入っているかを記事ごとに検査する。欠落があれば WARNING を出し、終了コード 1 で終わる
+- 画像はサイズと更新時刻が同じならコピーを省き、`index.md` は内容が変わったときだけ書き換える
+- 実行ログは `scripts/structurize_YYYY-MM-DD.log`（JST の日付）に追記される
 
 ---
 
